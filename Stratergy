@@ -1,0 +1,142 @@
+
+WHAT YOU NEED BEFORE STARTING EACH DAY
+NIFTY option chain data (minute-by-minute)
+Columns needed per minute: Spot price, Strike, Call OI, Put OI, Call LTP, Put LTP
+Strikes needed: ATM, ATM+1, ATM+2, ATM-1, ATM-2 (5 strikes total)
+Note 09:15 spot as your Open Reference for the day
+HOW TO FIND ATM STRIKE
+Round spot to nearest 50.
+Example: spot = 24,285 → ATM = 24,300
+
+ATM+1 = 24,350 | ATM+2 = 24,400
+ATM-1 = 24,250 | ATM-2 = 24,200
+ENTRY RULES — CHECK EVERY MINUTE FROM 09:20
+Step 1 — Check the time
+Condition	Action
+Before 09:20	Skip, too early
+10:00 to 10:59	SKIP entire hour — do not enter any trade
+After 15:15	Stop looking for new entries
+Step 2 — Calculate ATM OI Difference
+At the current ATM strike (offset 0):
+
+ATM Call OI  =  oi_call at current ATM strike
+ATM Put OI   =  oi_put  at current ATM strike
+ATM Diff     =  |ATM Call OI − ATM Put OI|
+Rule: ATM Diff must be ≥ 20 Lakh. If less → SKIP this minute.
+
+Step 3 — Calculate Outer OI Difference
+DO NOT include ATM in this calculation — only the surrounding strikes:
+
+Outer Call OI  =  oi_call[ATM+1]  +  oi_call[ATM+2]
+Outer Put OI   =  oi_put[ATM-1]   +  oi_put[ATM-2]
+Outer Diff     =  |Outer Call OI − Outer Put OI|
+Rule: Outer Diff must be ≥ 20 Lakh. If less → SKIP this minute.
+
+Step 4 — Check Both Point Same Direction
+ATM direction   =  CALL  if ATM Call OI < ATM Put OI
+                   PUT   if ATM Put OI  < ATM Call OI
+Outer direction =  CALL  if Outer Call OI < Outer Put OI
+                   PUT   if Outer Put OI  < Outer Call OI
+Rule: ATM direction must equal Outer direction. If they disagree → SKIP.
+
+The direction is: whichever side has the LOWER OI — trade that side.
+
+Step 5 — ATM Ratio Check
+ATM Ratio  =  larger OI ÷ smaller OI   (at ATM only)
+           =  max(ATM Call OI, ATM Put OI)  ÷  min(ATM Call OI, ATM Put OI)
+Rule: ATM Ratio must be ≥ 1.5 (one side must have 50% more OI than other). If less → SKIP.
+
+Step 6 — Outer/ATM Ratio Check (new in v23)
+Outer/ATM Ratio  =  Outer Diff ÷ ATM Diff
+Rule: Must be ≤ 5.0. If Outer Diff is more than 5× ATM Diff → signal is noise, SKIP.
+
+Example: ATM Diff = 20L, Outer Diff = 110L → ratio = 5.5 → SKIP
+Example: ATM Diff = 40L, Outer Diff = 120L → ratio = 3.0 → OK ✓
+
+Step 7 — Check the Option Premium (new in v23)
+Look up the LTP of the entry strike (ATM+2 for CALL, ATM-2 for PUT):
+
+CALL trade → check close_call at ATM+2
+PUT  trade → check close_put  at ATM-2
+Rule: Premium must be ≥ ₹20 AND ≤ ₹180.
+
+Below ₹20 = too cheap/illiquid
+Above ₹180 = move already priced in, signal unreliable → SKIP
+Step 8 — All Checks Passed → ENTER TRADE
+Direction	Buy This Option
+CALL (call OI was lower)	ATM+2 Call (CE) at current LTP
+PUT (put OI was lower)	ATM-2 Put (PE) at current LTP
+Record: Entry time, Entry premium (LTP), Entry ATM strike
+
+WHILE IN TRADE — CHECK EVERY MINUTE
+Exit A — SL Hit (check first, any time)
+If current LTP  ≤  Entry Premium × 0.80
+→ EXIT immediately. Loss = 20% of entry premium × 75 lots
+
+Exit B — Target Hit (check any time)
+If current LTP  ≥  Entry Premium × 2.00  (+100%)
+→ EXIT immediately. Profit = entry premium × 75 lots
+
+Exit C — Trailing Stop
+Activates once: current LTP ≥ Entry Premium × 1.70 (gain of +70%)
+After activation: EXIT if LTP falls back to Entry Premium × 1.20 (lock in +20%)
+Exit D — OI Signal Gone (checked every minute)
+Recalculate ATM Diff at current ATM strike each minute:
+
+Current ATM Diff  =  |current ATM Call OI − current ATM Put OI|
+Exit when EITHER of these persists for 2 consecutive minutes:
+
+Condition	Name
+ATM Diff drops below 20L	OI_EXIT_ATM_FELL
+Both ATM Diff AND Outer Diff drop below 20L	OI_EXIT_BOTH_FELL
+ATM lower side OR Outer lower side flips to opposite of trade direction	OI_EXIT_DIR_FLIP
+Important rule: If only Outer Diff drops below 20L but ATM Diff is still ≥ 20L and direction still same → IGNORE, stay in trade. (Outer is noisier, ATM is the anchor.)
+
+Exit E — Hard Exit
+15:19 PM — close everything regardless of P&L.
+
+DAILY LIMITS
+Rule	Value
+Maximum trades per day	3
+Daily loss limit	-₹8,000 (stop entering new trades if day P&L hits this)
+Cooldown after any exit	Wait 5 minutes before scanning for next entry
+QUICK EXAMPLE — MANUAL CHECK AT 09:45
+Check	Your Calculation	Pass?
+Time	09:45 — not in 10am block	✓
+Spot	23,485 → ATM = 23,500	
+ATM Call OI	82L	
+ATM Put OI	115L	
+ATM Diff	|82-115| = 33L ≥ 20L	✓
+ATM direction	82 < 115 → CALL	
+Outer Call OI	ATM+1(45L) + ATM+2(38L) = 83L	
+Outer Put OI	ATM-1(120L) + ATM-2(98L) = 218L	
+Outer Diff	|83-218| = 135L ≥ 20L	✓
+Outer direction	83 < 218 → CALL	✓ same
+ATM Ratio	115 ÷ 82 = 1.40 — fails! < 1.5	✗ SKIP
+→ Do not enter this minute. Wait and check again at 09:46.
+
+DECISION FLOWCHART
+Every minute 09:20 → 15:15 (skip 10:00-10:59):
+  Is time in 10am block?
+    YES → skip
+    NO  ↓
+  ATM Diff ≥ 20L?
+    NO  → skip
+    YES ↓
+  Outer Diff ≥ 20L?
+    NO  → skip
+    YES ↓
+  ATM direction = Outer direction?
+    NO  → skip
+    YES → Direction = lower OI side (CALL or PUT)
+          ↓
+  ATM Ratio ≥ 1.5?
+    NO  → skip
+    YES ↓
+  Outer Diff ÷ ATM Diff ≤ 5.0?
+    NO  → skip (anomaly)
+    YES ↓
+  Premium of ATM+2 (CALL) or ATM-2 (PUT): between ₹20 and ₹180?
+    NO  → skip
+    YES ↓
+  ★ ENTER TRADE at ATM+2 CE (CALL) or ATM-2 PE (PUT
