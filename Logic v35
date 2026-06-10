@@ -1,0 +1,624 @@
+"""
+OI Divergence Strategy  v29  — True Dynamic Threshold (Imbalance Ratio)
+========================================================================
+
+CORE PHILOSOPHY CHANGE:
+  Old approach: "OI diff > 20L" — FIXED, doesn't scale with market activity
+  New approach: "OI Imbalance Ratio > threshold%" — SELF-CALIBRATING
+
+  ATM Imbalance Ratio  = |call_oi - put_oi| / (call_oi + put_oi)
+  Outer Imbalance Ratio = |outer_call - outer_put| / (outer_call + outer_put)
+
+  This ratio is 0 when perfectly balanced, 1.0 when completely one-sided.
+  It AUTOMATICALLY scales with market activity:
+    Busy day  (ATM total = 400L): 15% ratio requires 60L diff  (harder to signal)
+    Average day (ATM total = 180L): 15% ratio requires 27L diff (normal)
+    Quiet day  (ATM total = 80L):  15% ratio requires 12L diff  (easier to signal)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INNOVATION 1 — SELF-CALIBRATING ENTRY (Imbalance Ratio)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Entry condition:
+  ATM Imbalance Ratio   >= ATM_IMBALANCE_MIN   (e.g. 0.15 = 15%)
+  Outer Imbalance Ratio >= OUTER_IMBALANCE_MIN  (e.g. 0.06 = 6%)
+  Both must agree on the same direction
+  ATM ratio (put/call extremity) >= 1.5
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INNOVATION 2 — OI TREND CONFIRMATION (signal must be building)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Before entering, check that the OI signal has been consistently in
+the SAME direction for at least OI_TREND_MINS consecutive minutes.
+This eliminates one-minute-wonder signals that appear and flip.
+
+  OI direction has been CALL for 3+ consecutive minutes → trend confirmed
+  If direction appeared just this minute → skip, wait
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INNOVATION 3 — SYMMETRIC EXIT with imbalance ratio
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Exit when ATM imbalance ratio drops below EXIT_IMBALANCE_MIN (0.07)
+OR direction flips — same symmetric logic as v23 but ratio-based.
+No asymmetric hold (that caused 22 negative days in v28).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALL OTHER RULES:
+  ATM+/-2 entry | Max 4 trades/day | Hour-10 blocked
+  Premium ₹20-₹180 | outer/ATM ratio <= 5.0
+  SL 20% | Target 100% | Trail +70%/+20%
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run: py -3 backtest_v29.py
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+DATA_FILE  = Path(__file__).parent / "atm_joined_2026.parquet"
+OUT_DIR    = Path(__file__).parent / "results"
+OUT_DIR.mkdir(exist_ok=True)
+
+LAKH = 100_000
+LOT  = 75
+
+# ── Dynamic imbalance thresholds (replace fixed 20L) ─────────────────────────
+# Entry: OI must be at least this % imbalanced
+ATM_IMBALANCE_MIN   = 0.15   # 15% of total ATM OI must be on one side
+OUTER_IMBALANCE_MIN = 0.06   # 6%  of total outer OI
+
+# Exit: ATM imbalance dropped below this % → signal gone
+EXIT_IMBALANCE_MIN  = 0.07   # 7% (lower than entry = some tolerance before exiting)
+
+# ── OI trend confirmation ─────────────────────────────────────────────────────
+OI_TREND_MINS = 3   # ATM direction must have been consistent for N minutes
+
+# ── All other params same as v23 ─────────────────────────────────────────────
+MIN_ATM_RATIO        = 1.5
+MAX_OUTER_ATM_RATIO  = 5.0
+MAX_ENTRY_PREMIUM    = 180.0
+EXIT_PERSIST         = 2
+MAX_TRADES_DAY       = 4
+
+SL_PCT         = 0.20
+TARGET_PCT     = 1.00
+TRAIL_TRIG_PCT = 0.70
+TRAIL_LOCK_PCT = 0.20
+
+SCAN_START       = pd.Timestamp("09:20").time()
+ENTRY_CUTOFF     = pd.Timestamp("15:15").time()
+HARD_EXIT        = pd.Timestamp("15:19").time()
+MIN_PREMIUM      = 30.0   # RAISED from 20 → 30 (₹20-30 options only 44.4% win rate, 5 SL hits)
+REENTRY_COOLDOWN = 5
+DAILY_LOSS_LIMIT = -8000
+BLOCK_HOUR_START = pd.Timestamp("10:00").time()
+BLOCK_HOUR_END   = pd.Timestamp("10:59").time()
+
+# ── Finding 1: Skip CALL when spot is in the "dip zone" ──────────────────────
+# Analysis: CALL when spot_vs_open is between -30 and 0 = 0% win rate (4 trades, all losers)
+# Market has dipped slightly from open but hasn't recovered → still in decline mode
+# Paradox: CALL when spot < -30 (big drop) = 100% win (8 trades)  ← keep those
+# So only block the partial/uncertain dip zone (-30 to 0)
+CALL_BLOCK_ZONE_LOW  = -30.0   # CALL blocked when spot_vs_open >= this
+CALL_BLOCK_ZONE_HIGH =   0.0   # CALL blocked when spot_vs_open <= this
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OI helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_data():
+    df = pd.read_parquet(DATA_FILE)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["date"] = df["timestamp"].dt.date
+    df.sort_values(["timestamp", "strike_offset"], inplace=True)
+    return df
+
+
+def atm_oi(snap):
+    row = snap[snap["strike_offset"] == 0]
+    if row.empty:
+        return 0, 0
+    return int(row.iloc[0]["oi_call"]), int(row.iloc[0]["oi_put"])
+
+
+def outer_oi(snap):
+    c = snap[snap["strike_offset"].isin([1, 2])]["oi_call"].sum()
+    p = snap[snap["strike_offset"].isin([-1, -2])]["oi_put"].sum()
+    return int(c), int(p)
+
+
+def imbalance_ratio(a, b):
+    """
+    |a - b| / (a + b) — returns 0 to 1.
+    0 = perfectly balanced, 1 = completely one-sided.
+    """
+    total = a + b
+    if total == 0:
+        return 0.0
+    return abs(a - b) / total
+
+
+def atm_ratio_val(atm_c, atm_p):
+    if atm_c == 0 or atm_p == 0:
+        return 0.0
+    return max(atm_p / atm_c, atm_c / atm_p)
+
+
+def check_oi_direction(snap):
+    """
+    Returns (atm_dir, outer_dir, atm_imb, outer_imb) or None if no valid snap.
+    """
+    atm_c, atm_p     = atm_oi(snap)
+    outer_c, outer_p = outer_oi(snap)
+    atm_imb   = imbalance_ratio(atm_c, atm_p)
+    outer_imb = imbalance_ratio(outer_c, outer_p)
+    atm_dir   = "CALL" if atm_c < atm_p else "PUT"
+    outer_dir = "CALL" if outer_c < outer_p else "PUT"
+    return atm_dir, outer_dir, atm_imb, outer_imb, atm_c, atm_p, outer_c, outer_p
+
+
+def oi_trend_ok(day_df, current_ts, signal_dir, lookback):
+    """
+    Check that ATM OI direction has been CONSISTENTLY signal_dir for
+    the last `lookback` consecutive minutes (including current minute).
+    Returns True if trending confirmed.
+    """
+    atm_rows = day_df[day_df["strike_offset"] == 0].sort_values("timestamp")
+    past = atm_rows[atm_rows["timestamp"] <= current_ts].tail(lookback)
+    if len(past) < lookback:
+        return False   # not enough history yet (e.g. first few minutes)
+    for _, row in past.iterrows():
+        c = int(row["oi_call"]); p = int(row["oi_put"])
+        minute_dir = "CALL" if c < p else "PUT"
+        if minute_dir != signal_dir:
+            return False   # direction was different at some point
+    return True
+
+
+def check_premium_exit(entry_px, current_px, trail_on):
+    if current_px <= entry_px * (1 - SL_PCT):
+        return True, "SL_HIT", trail_on
+    if current_px >= entry_px * (1 + TARGET_PCT):
+        return True, "TARGET_HIT", trail_on
+    if current_px >= entry_px * (1 + TRAIL_TRIG_PCT):
+        trail_on = True
+    if trail_on and current_px <= entry_px * (1 + TRAIL_LOCK_PCT):
+        return True, "TRAIL_SL", trail_on
+    return False, None, trail_on
+
+
+OFFSET_LABEL = {2: "ATM+2", 1: "ATM+1", 0: "ATM", -1: "ATM-1", -2: "ATM-2"}
+
+
+def make_record(date, entry_ts, exit_ts, direction, entry_strike,
+                entry_px, exit_px, pnl, reason, trade_num,
+                atm_c, atm_p, outer_c, outer_p,
+                atm_imb, outer_imb,
+                open_ref, entry_spot, entry_offset,
+                exit_snap=None):
+    def _L(v): return round(v / LAKH, 1) if v is not None else None
+    def _pct(v): return round(v * 100, 1) if v is not None else None
+
+    ex_atm_c = ex_atm_p = ex_outer_c = ex_outer_p = ex_atm_strike = None
+    ex_atm_imb = ex_outer_imb = None
+    if exit_snap is not None and not exit_snap.empty:
+        arow = exit_snap[exit_snap["strike_offset"] == 0]
+        if not arow.empty:
+            ex_atm_strike = float(arow.iloc[0]["strike"])
+            ex_atm_c = int(arow.iloc[0]["oi_call"])
+            ex_atm_p = int(arow.iloc[0]["oi_put"])
+            ex_atm_imb = imbalance_ratio(ex_atm_c, ex_atm_p)
+        oc = exit_snap[exit_snap["strike_offset"].isin([1, 2])]["oi_call"].sum()
+        op = exit_snap[exit_snap["strike_offset"].isin([-1, -2])]["oi_put"].sum()
+        ex_outer_c = int(oc); ex_outer_p = int(op)
+        ex_outer_imb = imbalance_ratio(ex_outer_c, ex_outer_p)
+
+    return {
+        "date":                  date,
+        "day":                   pd.Timestamp(str(date)).day_name()[:3],
+        "trade_num":             trade_num,
+        "entry_time":            entry_ts.strftime("%H:%M"),
+        "exit_time":             exit_ts.strftime("%H:%M") if exit_ts else None,
+        "direction":             direction,
+        "entry_strike":          entry_strike,
+        "entry_offset":          OFFSET_LABEL.get(entry_offset, str(entry_offset)),
+        # Entry OI
+        "entry_atm_call_L":      _L(atm_c),
+        "entry_atm_put_L":       _L(atm_p),
+        "entry_atm_diff_L":      _L(abs(atm_c - atm_p)),
+        "entry_atm_imb_pct":     _pct(atm_imb),    # NEW: imbalance %
+        "entry_outer_call_L":    _L(outer_c),
+        "entry_outer_put_L":     _L(outer_p),
+        "entry_outer_diff_L":    _L(abs(outer_c - outer_p)),
+        "entry_outer_imb_pct":   _pct(outer_imb),  # NEW: outer imbalance %
+        "atm_ratio":             round(atm_ratio_val(atm_c, atm_p), 2),
+        "open_ref":              round(open_ref, 1) if open_ref else None,
+        "entry_spot":            round(entry_spot, 1),
+        "spot_vs_open":          round(entry_spot - open_ref, 1) if open_ref else None,
+        "entry_premium":         round(entry_px, 2),
+        "exit_premium":          round(exit_px, 2),
+        "pnl_per_lot":           round(pnl, 2),
+        "exit_reason":           reason,
+        "duration_min":          int((exit_ts - entry_ts).seconds / 60) if exit_ts else None,
+        # Exit OI snapshot
+        "exit_atm_strike":       ex_atm_strike,
+        "exit_atm_call_L":       _L(ex_atm_c),
+        "exit_atm_put_L":        _L(ex_atm_p),
+        "exit_atm_diff_L":       _L(abs(ex_atm_c - ex_atm_p)) if ex_atm_c is not None else None,
+        "exit_atm_imb_pct":      _pct(ex_atm_imb),
+        "exit_outer_call_L":     _L(ex_outer_c),
+        "exit_outer_put_L":      _L(ex_outer_p),
+        "exit_outer_diff_L":     _L(abs(ex_outer_c - ex_outer_p)) if ex_outer_c is not None else None,
+        "exit_outer_imb_pct":    _pct(ex_outer_imb),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core day loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def backtest_day(day_df, date):
+    trades     = []
+    timestamps = sorted(day_df["timestamp"].unique())
+
+    def snap(ts):
+        return day_df[day_df["timestamp"] == ts]
+
+    ts_open   = pd.Timestamp(str(date) + " 09:15:00")
+    open_snap = snap(ts_open)
+    if open_snap.empty and timestamps:
+        open_snap = day_df[day_df["timestamp"] == timestamps[0]]
+    open_ref = float(open_snap.iloc[0]["spot"]) if not open_snap.empty else None
+
+    in_trade       = False
+    entry_px = entry_ts = direction = entry_strike = entry_offset = None
+    e_atm_c = e_atm_p = e_outer_c = e_outer_p = e_spot = None
+    e_atm_imb = e_outer_imb = None
+    e_trade_num = 0
+    trail_on       = False
+    oi_exit_consec = 0
+
+    day_pnl      = 0.0
+    trades_today = 0
+    reentry_after = None
+
+    for ts in timestamps:
+        t = ts.time()
+        if t < SCAN_START:
+            continue
+
+        if t > HARD_EXIT:
+            if in_trade:
+                s   = snap(ts)
+                row = s[s["strike"] == entry_strike]
+                col = "close_call" if direction == "CALL" else "close_put"
+                px  = float(row.iloc[0][col]) if not row.empty else entry_px
+                pnl = (px - entry_px) * LOT
+                day_pnl += pnl
+                trades.append(make_record(
+                    date, entry_ts, ts, direction, entry_strike,
+                    entry_px, px, pnl, "HARD_EXIT", e_trade_num,
+                    e_atm_c, e_atm_p, e_outer_c, e_outer_p,
+                    e_atm_imb, e_outer_imb,
+                    open_ref, e_spot, entry_offset, exit_snap=s))
+                in_trade = False
+            break
+
+        s        = snap(ts)
+        cur_spot = float(s.iloc[0]["spot"]) if not s.empty else np.nan
+
+        # ══════════════════════════════════════════════════════════════════
+        # IN TRADE
+        # ══════════════════════════════════════════════════════════════════
+        if in_trade:
+            row = s[s["strike"] == entry_strike]
+            if row.empty:
+                continue
+            col        = "close_call" if direction == "CALL" else "close_put"
+            current_px = float(row.iloc[0][col])
+            if np.isnan(current_px):
+                continue
+
+            # Premium exits
+            should_exit, reason, trail_on = check_premium_exit(
+                entry_px, current_px, trail_on)
+            if should_exit:
+                pnl = (current_px - entry_px) * LOT
+                day_pnl += pnl
+                trades.append(make_record(
+                    date, entry_ts, ts, direction, entry_strike,
+                    entry_px, current_px, pnl, reason, e_trade_num,
+                    e_atm_c, e_atm_p, e_outer_c, e_outer_p,
+                    e_atm_imb, e_outer_imb,
+                    open_ref, e_spot, entry_offset, exit_snap=s))
+                in_trade       = False
+                trail_on       = False
+                oi_exit_consec = 0
+                trades_today  += 1
+                reentry_after  = ts + pd.Timedelta(minutes=REENTRY_COOLDOWN)
+                continue
+
+            # OI exit — ratio-based, symmetric
+            atm_c2, atm_p2     = atm_oi(s)
+            outer_c2, outer_p2 = outer_oi(s)
+            atm_imb2    = imbalance_ratio(atm_c2, atm_p2)
+            outer_imb2  = imbalance_ratio(outer_c2, outer_p2)
+            atm_dir2    = "CALL" if atm_c2   < atm_p2   else "PUT"
+            outer_dir2  = "CALL" if outer_c2 < outer_p2 else "PUT"
+
+            atm_ok   = (atm_imb2   >= EXIT_IMBALANCE_MIN) and (atm_dir2   == direction)
+            outer_ok = (outer_imb2 >= EXIT_IMBALANCE_MIN) and (outer_dir2 == direction)
+
+            if atm_ok and not outer_ok:
+                oi_exit_consec = 0   # outer alone fell — ignore, stay in
+            elif not atm_ok:
+                oi_exit_consec += 1
+            elif atm_dir2 != direction or outer_dir2 != direction:
+                oi_exit_consec += 1
+            else:
+                oi_exit_consec = 0
+
+            if oi_exit_consec >= EXIT_PERSIST:
+                pnl = (current_px - entry_px) * LOT
+                day_pnl += pnl
+                if atm_imb2 < EXIT_IMBALANCE_MIN and outer_imb2 < EXIT_IMBALANCE_MIN:
+                    exit_reason = "OI_EXIT_BOTH_FELL"
+                elif atm_imb2 < EXIT_IMBALANCE_MIN:
+                    exit_reason = "OI_EXIT_ATM_FELL"
+                else:
+                    exit_reason = "OI_EXIT_DIR_FLIP"
+                trades.append(make_record(
+                    date, entry_ts, ts, direction, entry_strike,
+                    entry_px, current_px, pnl, exit_reason, e_trade_num,
+                    e_atm_c, e_atm_p, e_outer_c, e_outer_p,
+                    e_atm_imb, e_outer_imb,
+                    open_ref, e_spot, entry_offset, exit_snap=s))
+                in_trade       = False
+                trail_on       = False
+                oi_exit_consec = 0
+                trades_today  += 1
+                reentry_after  = ts + pd.Timedelta(minutes=REENTRY_COOLDOWN)
+
+        # ══════════════════════════════════════════════════════════════════
+        # NOT IN TRADE
+        # ══════════════════════════════════════════════════════════════════
+        else:
+            if t > ENTRY_CUTOFF:
+                continue
+            if trades_today >= MAX_TRADES_DAY:
+                continue
+            if day_pnl <= DAILY_LOSS_LIMIT:
+                continue
+            if reentry_after and ts < reentry_after:
+                continue
+            if BLOCK_HOUR_START <= t <= BLOCK_HOUR_END:
+                continue
+
+            # Evaluate entry signal (imbalance ratio based)
+            atm_dir, outer_dir, atm_imb, outer_imb, atm_c, atm_p, outer_c, outer_p = \
+                check_oi_direction(s)
+
+            if atm_imb < ATM_IMBALANCE_MIN:
+                continue
+            if outer_imb < OUTER_IMBALANCE_MIN:
+                continue
+            if atm_dir != outer_dir:
+                continue
+
+            ratio = atm_ratio_val(atm_c, atm_p)
+            if ratio < MIN_ATM_RATIO:
+                continue
+
+            # Outer/ATM noise filter
+            atm_diff_now   = abs(atm_c - atm_p)
+            outer_diff_now = abs(outer_c - outer_p)
+            if atm_diff_now > 0 and (outer_diff_now / atm_diff_now) > MAX_OUTER_ATM_RATIO:
+                continue
+
+            sig_dir = atm_dir
+
+            # FINDING 1: Skip CALL when spot is in the partial dip zone (-30 to 0)
+            # Analysis showed: 0% win rate on 4 CALL trades in this zone (all losers)
+            # Why: spot just below open = market still in mild decline, CALL signal unreliable
+            # NOT blocked: CALL when spot < -30 (big drop = OI shift is genuine = 100% win)
+            if open_ref is not None and not np.isnan(cur_spot):
+                svopen = cur_spot - open_ref
+                if sig_dir == "CALL" and CALL_BLOCK_ZONE_LOW <= svopen <= CALL_BLOCK_ZONE_HIGH:
+                    continue   # CALL in dip zone → skip (0% win historically)
+
+            # OI trend confirmation: signal must have been present N consecutive minutes
+            if not oi_trend_ok(day_df, ts, sig_dir, OI_TREND_MINS):
+                continue   # signal appeared but hasn't been trending yet
+
+            # Premium check (FINDING 2: MIN_PREMIUM raised to 30 — ₹20-30 only 44% win)
+            off = 2 if sig_dir == "CALL" else -2
+            row = s[s["strike_offset"] == off]
+            if row.empty:
+                continue
+            col = "close_call" if sig_dir == "CALL" else "close_put"
+            px  = float(row.iloc[0][col])
+            if np.isnan(px) or px < MIN_PREMIUM or px > MAX_ENTRY_PREMIUM:
+                continue
+
+            entry_px       = px
+            entry_ts       = ts
+            direction      = sig_dir
+            entry_strike   = float(row.iloc[0]["strike"])
+            entry_offset   = off
+            e_atm_c, e_atm_p     = atm_c, atm_p
+            e_outer_c, e_outer_p = outer_c, outer_p
+            e_atm_imb, e_outer_imb = atm_imb, outer_imb
+            e_spot         = cur_spot
+            e_trade_num    = trades_today + 1
+            in_trade       = True
+            trail_on       = False
+            oi_exit_consec = 0
+
+    return trades
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runner + Report
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_backtest(df):
+    all_trades = []
+    dates = sorted(df["date"].unique())
+    print(f"Running v35 on {len(dates)} days")
+    print(f"  Entry: ATM imbalance>={ATM_IMBALANCE_MIN*100:.0f}% + Outer>={OUTER_IMBALANCE_MIN*100:.0f}%  (v29 base)")
+    print(f"  NEW FILTER 1: Skip CALL when spot_vs_open between {CALL_BLOCK_ZONE_LOW} and {CALL_BLOCK_ZONE_HIGH}")
+    print(f"  NEW FILTER 2: Min premium raised Rs20 -> Rs{int(MIN_PREMIUM)}")
+    print(f"  Trend confirm: {OI_TREND_MINS} min | SL {int(SL_PCT*100)}% | Target {int(TARGET_PCT*100)}%")
+    print(f"  Max {MAX_TRADES_DAY} trades/day | hr10 blocked | prem <=180 | SL {int(SL_PCT*100)}%")
+    print()
+
+    for d in dates:
+        day_df = df[df["date"] == d].copy()
+        trades = backtest_day(day_df, d)
+        day_pnl = sum(tr["pnl_per_lot"] for tr in trades)
+        dow = pd.Timestamp(str(d)).day_name()[:3]
+        flag = "  <<< NEGATIVE" if day_pnl < 0 else ""
+        print(f"  {d} ({dow})  trades={len(trades):2d}  P&L=INR {day_pnl:>10,.0f}{flag}")
+        all_trades.extend(trades)
+
+    return pd.DataFrame(all_trades)
+
+
+def print_summary(df, dates_count):
+    if df.empty:
+        print("No trades generated.")
+        return None
+
+    wins   = df[df["pnl_per_lot"] > 0]
+    losses = df[df["pnl_per_lot"] <= 0]
+    n   = len(df)
+    gp  = wins["pnl_per_lot"].sum()
+    gl  = abs(losses["pnl_per_lot"].sum())
+    net = df["pnl_per_lot"].sum()
+    wr  = len(wins) / n * 100
+    pf  = gp / gl if gl > 0 else float("inf")
+    aw  = wins["pnl_per_lot"].mean() if len(wins) else 0
+    al  = losses["pnl_per_lot"].mean() if len(losses) else 0
+    exp = (wr / 100) * aw + (1 - wr / 100) * al
+    cum = df["pnl_per_lot"].cumsum()
+    mdd = (cum - cum.cummax()).min()
+    streak = max_streak = 0
+    for v in df["pnl_per_lot"]:
+        streak = streak + 1 if v <= 0 else 0
+        max_streak = max(max_streak, streak)
+
+    day_pnl  = df.groupby("date")["pnl_per_lot"].sum()
+    pos_days = (day_pnl > 0).sum()
+    neg_days = (day_pnl <= 0).sum()
+
+    rows = [
+        ("Total Trades",         n),
+        ("Trading Days",         dates_count),
+        ("Days with Trades",     len(day_pnl)),
+        ("Positive Days",        int(pos_days)),
+        ("Negative Days",        int(neg_days)),
+        ("Win Rate %",           round(wr, 1)),
+        ("Net P&L INR",          round(net, 0)),
+        ("Gross Profit INR",     round(gp, 0)),
+        ("Gross Loss INR",       round(gl, 0)),
+        ("Profit Factor",        round(pf, 2)),
+        ("Avg Win INR",          round(aw, 0)),
+        ("Avg Loss INR",         round(al, 0)),
+        ("Expectancy INR",       round(exp, 0)),
+        ("Max Drawdown INR",     round(mdd, 0)),
+        ("Max Consec Losses",    max_streak),
+        ("Avg Duration (min)",   round(df["duration_min"].mean(), 1)),
+        ("Avg Trades/Day",       round(n / dates_count, 2)),
+    ]
+    for r, cnt in df["exit_reason"].value_counts().items():
+        rows.append((f"Exit: {r}", int(cnt)))
+
+    smry = pd.DataFrame(rows, columns=["Metric", "Value"])
+    print()
+    print("=" * 68)
+    print("BACKTEST SUMMARY - v35  (v29 + skip CALL -30to0 zone + min premium 30)")
+    print("=" * 68)
+    print(smry.to_string(index=False))
+
+    print("\n--- By Trade # ---")
+    for tn, g in df.groupby("trade_num"):
+        w2 = (g["pnl_per_lot"] > 0).sum() / len(g) * 100
+        sl = (g["exit_reason"] == "SL_HIT").sum()
+        print(f"  Trade #{tn}  trades={len(g):3d}  win={w2:.1f}%  "
+              f"avg={g['pnl_per_lot'].mean():>8.0f}  total={g['pnl_per_lot'].sum():>10.0f}  SL={sl}")
+
+    print("\n--- By Direction ---")
+    for d2, g in df.groupby("direction"):
+        w2 = (g["pnl_per_lot"] > 0).sum() / len(g) * 100
+        print(f"  {d2:4}  trades={len(g):3d}  win={w2:.1f}%  "
+              f"avg={g['pnl_per_lot'].mean():>8.0f}  total={g['pnl_per_lot'].sum():>10.0f}")
+
+    print("\n--- By Exit Reason ---")
+    for er, g in df.groupby("exit_reason"):
+        print(f"  {er:<28}  trades={len(g):3d}  "
+              f"avg={g['pnl_per_lot'].mean():>8.0f}  total={g['pnl_per_lot'].sum():>10.0f}")
+
+    print("\n--- ATM Imbalance % at entry ---")
+    print(f"  Winners avg: {wins['entry_atm_imb_pct'].mean():.1f}%  "
+          f"Losers avg: {losses['entry_atm_imb_pct'].mean():.1f}%")
+
+    print("\n--- By Day of Week ---")
+    df["dow"] = pd.to_datetime(df["date"]).dt.day_name()
+    for day in ["Monday","Tuesday","Wednesday","Thursday","Friday"]:
+        g = df[df["dow"] == day]
+        if g.empty: continue
+        w2 = (g["pnl_per_lot"] > 0).sum() / len(g) * 100
+        sl = (g["exit_reason"] == "SL_HIT").sum()
+        print(f"  {day:<12}  trades={len(g):3d}  win={w2:.1f}%  "
+              f"avg={g['pnl_per_lot'].mean():>8.0f}  total={g['pnl_per_lot'].sum():>10.0f}  SL={sl}")
+
+    print("\n--- Entry hour ---")
+    df["entry_hour"] = df["entry_time"].apply(lambda x: x[:2])
+    for hr, g in df.groupby("entry_hour"):
+        w2 = (g["pnl_per_lot"] > 0).sum() / len(g) * 100
+        sl = (g["exit_reason"] == "SL_HIT").sum()
+        print(f"  {hr}:xx  trades={len(g):3d}  win={w2:.1f}%  "
+              f"avg={g['pnl_per_lot'].mean():>8.0f}  SL={sl}")
+
+    print("\n--- Day-wise P&L ---")
+    dpnl = day_pnl.reset_index()
+    dpnl.columns = ["Date", "Net_PNL"]
+    dpnl["Day"] = pd.to_datetime(dpnl["Date"]).dt.day_name().str[:3]
+    dpnl["Cumulative"] = dpnl["Net_PNL"].cumsum()
+    dpnl["Flag"] = dpnl["Net_PNL"].apply(lambda x: "NEGATIVE" if x < 0 else "")
+    print(dpnl.to_string(index=False))
+    print(f"\nPositive days: {pos_days} / {len(day_pnl)}  |  "
+          f"Negative days: {neg_days} / {len(day_pnl)}")
+
+    return smry
+
+
+def main():
+    print("Loading atm_joined_2026.parquet ...")
+    df = load_data()
+    dates_count = df["date"].nunique()
+    print(f"  {len(df):,} rows | {dates_count} days | "
+          f"{df['timestamp'].min().date()} to {df['timestamp'].max().date()}")
+    print()
+
+    trades_df = run_backtest(df)
+
+    if trades_df.empty:
+        print("No trades generated.")
+        return
+
+    out_trades  = OUT_DIR / "v35_trades.csv"
+    out_summary = OUT_DIR / "v35_summary.csv"
+    trades_df.to_csv(out_trades, index=False)
+
+    smry = print_summary(trades_df, dates_count)
+    if smry is not None:
+        smry.to_csv(out_summary, index=False)
+
+    print(f"\nSaved: {out_trades}")
+    print(f"Saved: {out_summary}")
+
+
+if __name__ == "__main__":
+    main()
