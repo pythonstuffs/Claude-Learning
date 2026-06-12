@@ -1,0 +1,1195 @@
+"""
+OI Divergence Strategy Engine — Live Forward Testing  (v47 logic)
+=================================================================
+Entry: v29/v37/v43 imbalance-ratio + OI trend confirmation (unchanged).
+Exit:  Hybrid two-phase system —
+  Phase 1 (first EARLY_ATM_BARS ticks): fast-fail ATM-alone check.
+    If ATM signal fails EXIT_PERSIST consecutive bars → OI_EXIT_EARLY_ATM.
+  Phase 2 (after EARLY_ATM_BARS ticks): dynamic zone exit (v43).
+    Zone determined by current ATM vs entry_strike position:
+      FAR_OTM  → both ATM + outer must fail × EXIT_PERSIST
+      NEAR_OTM → both ATM + ring (±1) must fail × EXIT_PERSIST
+      ATM      → ATM alone fails × EXIT_PERSIST
+      ITM      → immediate exit on ATM direction reversal
+
+Data source : _latest option chain (from app.py poll loop)
+Execution   : paper (log only) or live (via mstock broker registry)
+Per-user    : one paper engine + one live engine per registered user
+"""
+from __future__ import annotations
+
+import datetime as dt
+import threading
+from collections import deque
+from typing import Optional
+
+import config as cfg
+
+# ─────────────────────────────────────────────────────────────
+# Constants  (v29 rules)
+# ─────────────────────────────────────────────────────────────
+LAKH        = 100_000
+LOT         = 65
+STRIKE_STEP = 50          # NIFTY 50-point intervals
+
+# Dynamic imbalance thresholds (replace v23 fixed 20L diff)
+ATM_IMBALANCE_MIN   = 0.15   # 15% of total ATM OI must be on one side
+OUTER_IMBALANCE_MIN = 0.06   # 6%  of total outer OI
+EXIT_IMBALANCE_MIN  = 0.07   # 7%  — ATM must still be ≥ this to stay in
+
+# OI trend confirmation — direction must be consistent for N ticks
+OI_TREND_MINS = 3
+
+MIN_ATM_RATIO       = 1.5
+MAX_OUTER_ATM_RATIO = 5.0
+MIN_PREMIUM         = 30.0   # raised from 20 (₹20-30 options show 44% win rate)
+MAX_ENTRY_PREMIUM   = 180.0
+
+SL_PCT         = 0.18
+TARGET_PCT     = 1.00
+TRAIL_TRIG_PCT = 0.70
+TRAIL_LOCK_PCT = 0.20
+
+EXIT_PERSIST    = 2    # consecutive ticks before OI exit fires
+EARLY_ATM_BARS  = 5    # first N bars: fast-fail ATM-alone gate (Phase 1)
+BROKERAGE       = 300.0  # ₹ deducted from running balance per completed trade (paper + live)
+
+# Skip CALL when spot is in the partial dip zone (-30 to 0 vs open)
+CALL_BLOCK_ZONE_LOW  = -30.0
+CALL_BLOCK_ZONE_HIGH =   0.0
+
+SCAN_START_H,  SCAN_START_M  =  9, 20
+ENTRY_CUTOFF_H, ENTRY_CUTOFF_M = 15, 15
+HARD_EXIT_H,  HARD_EXIT_M    = 15, 19
+BLOCK_START_H, BLOCK_START_M  = 10,  0
+BLOCK_END_H,   BLOCK_END_M    = 10, 59
+
+MAX_TRADES_DAY   = 4       # raised from 3 in v29
+DAILY_LOSS_LIMIT = -8_000.0
+REENTRY_COOLDOWN = 5       # minutes
+
+
+# ─────────────────────────────────────────────────────────────
+# Helpers — option chain parsing
+# ─────────────────────────────────────────────────────────────
+
+def _atm_strike(spot: float) -> int:
+    return int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+
+
+def _get_row(rows: list, strike: int) -> Optional[dict]:
+    for r in rows:
+        if int(r.get("strike", -1)) == strike:
+            return r
+    return None
+
+
+def _oi(row: Optional[dict], side: str) -> int:
+    if row is None:
+        return 0
+    sub = row.get(side) or {}
+    return int(sub.get("oi") or sub.get("oi_call") or sub.get("oi_put") or 0)
+
+
+def _ltp(row: Optional[dict], side: str) -> float:
+    if row is None:
+        return 0.0
+    sub = row.get(side) or {}
+    return float(sub.get("ltp") or sub.get("close") or 0.0)
+
+
+def _sec_id(row: Optional[dict], side: str) -> str:
+    if row is None:
+        return ""
+    sub = row.get(side) or {}
+    return str(sub.get("security_id") or "")
+
+
+def _atm_oi(rows: list, atm: int):
+    row = _get_row(rows, atm)
+    return _oi(row, "call"), _oi(row, "put")
+
+
+def _outer_oi(rows: list, atm: int):
+    c = (_oi(_get_row(rows, atm + STRIKE_STEP), "call")
+         + _oi(_get_row(rows, atm + 2 * STRIKE_STEP), "call"))
+    p = (_oi(_get_row(rows, atm - STRIKE_STEP), "put")
+         + _oi(_get_row(rows, atm - 2 * STRIKE_STEP), "put"))
+    return c, p
+
+
+def _imbalance_ratio(a: int, b: int) -> float:
+    """
+    |a - b| / (a + b).  0 = balanced, 1 = completely one-sided.
+    Self-calibrates with total market activity — scales correctly on
+    quiet/busy days without needing a fixed absolute threshold.
+    """
+    total = a + b
+    if total == 0:
+        return 0.0
+    return abs(a - b) / total
+
+
+def _atm_ratio(atm_c: int, atm_p: int) -> float:
+    if atm_c == 0 or atm_p == 0:
+        return 0.0
+    return max(atm_p / atm_c, atm_c / atm_p)
+
+
+_MONTH_CODE = {
+    "JAN":"1","FEB":"2","MAR":"3","APR":"4","MAY":"5","JUN":"6",
+    "JUL":"7","AUG":"8","SEP":"9","OCT":"O","NOV":"N","DEC":"D",
+}
+
+def _is_monthly_expiry(d: dt.date) -> bool:
+    """Last Tuesday of the month = monthly expiry."""
+    return (d + dt.timedelta(days=7)).month != d.month
+
+def _mstock_trading_symbol(strike: int, opt_type: str, expiry_iso: str) -> str:
+    """
+    Build mStock NFO trading symbol.
+      Monthly (last Tue of month): NIFTY{YY}{MMM}{STRIKE}{OPT}  e.g. NIFTY26JUN23150CE
+      Weekly  (other Tuesdays):    NIFTY{YY}{M}{DD}{STRIKE}{OPT} e.g. NIFTY2661623150CE
+    """
+    try:
+        exp  = dt.datetime.strptime(expiry_iso, "%Y-%m-%d").date()
+        yy   = exp.strftime("%y")
+        mon3 = exp.strftime("%b").upper()
+        if _is_monthly_expiry(exp):
+            return f"NIFTY{yy}{mon3}{strike}{opt_type}"
+        else:
+            m_char = _MONTH_CODE.get(mon3, "")
+            dd = exp.strftime("%d")
+            return f"NIFTY{yy}{m_char}{dd}{strike}{opt_type}"
+    except Exception:
+        return ""
+
+def _nse_trading_symbol(strike: int, opt_type: str, expiry: str) -> str:
+    """Legacy NSE format — kept for non-mStock brokers."""
+    try:
+        exp = dt.datetime.strptime(expiry, "%Y-%m-%d")
+        return f"NIFTY{exp.strftime('%d%b%y').upper()}{strike}{opt_type}"
+    except Exception:
+        return ""
+
+
+def _evaluate_entry(rows: list, atm: int):
+    """
+    v29 imbalance-ratio entry check.
+    Returns (valid, direction, atm_c, atm_p, outer_c, outer_p,
+             atm_imb, outer_imb, skip_reason)
+    """
+    atm_c,   atm_p   = _atm_oi(rows, atm)
+    outer_c, outer_p = _outer_oi(rows, atm)
+
+    atm_imb   = _imbalance_ratio(atm_c, atm_p)
+    outer_imb = _imbalance_ratio(outer_c, outer_p)
+
+    if atm_imb < ATM_IMBALANCE_MIN:
+        return (False, None, atm_c, atm_p, outer_c, outer_p,
+                atm_imb, outer_imb,
+                f"ATM_IMB_LOW({atm_imb*100:.1f}%)")
+
+    if outer_imb < OUTER_IMBALANCE_MIN:
+        return (False, None, atm_c, atm_p, outer_c, outer_p,
+                atm_imb, outer_imb,
+                f"OUTER_IMB_LOW({outer_imb*100:.1f}%)")
+
+    atm_dir   = "CALL" if atm_c   < atm_p   else "PUT"
+    outer_dir = "CALL" if outer_c < outer_p else "PUT"
+
+    if atm_dir != outer_dir:
+        return (False, None, atm_c, atm_p, outer_c, outer_p,
+                atm_imb, outer_imb,
+                f"DIR_DISAGREE(ATM={atm_dir},OUT={outer_dir})")
+
+    ratio = _atm_ratio(atm_c, atm_p)
+    if ratio < MIN_ATM_RATIO:
+        return (False, None, atm_c, atm_p, outer_c, outer_p,
+                atm_imb, outer_imb,
+                f"ATM_RATIO_LOW({ratio:.2f})")
+
+    # outer/ATM noise filter (on absolute diffs)
+    atm_diff   = abs(atm_c - atm_p)
+    outer_diff = abs(outer_c - outer_p)
+    outer_atm_r = outer_diff / atm_diff if atm_diff > 0 else 0
+    if outer_atm_r > MAX_OUTER_ATM_RATIO:
+        return (False, None, atm_c, atm_p, outer_c, outer_p,
+                atm_imb, outer_imb,
+                f"OUTER_ATM_RATIO_HIGH({outer_atm_r:.1f})")
+
+    return (True, atm_dir, atm_c, atm_p, outer_c, outer_p,
+            atm_imb, outer_imb, "OK")
+
+
+# _check_oi_exit removed in v47 — exit logic is now instance methods on the engine
+
+
+
+# ─────────────────────────────────────────────────────────────
+# Engine
+# ─────────────────────────────────────────────────────────────
+
+class OIStrategyEngine:
+    """
+    Real-time OI divergence engine (v29 logic).
+    Call on_tick(oc_data) once per minute from the poll loop.
+    """
+
+    def __init__(self, store, broker_registry=None,
+                 user_id: Optional[int] = None,
+                 paper_mode: bool = True):
+        self._store           = store
+        self._broker_registry = broker_registry
+        self.user_id          = user_id
+        self.paper_mode       = paper_mode
+        self._lock            = threading.Lock()
+
+        # ── per-day state ──────────────────────────────────────
+        self._session_date:  Optional[dt.date]     = None
+        self._open_ref:      float                 = 0.0
+        self._day_pnl:       float                 = 0.0
+        self._trades_today:  int                   = 0
+        self._reentry_after: Optional[dt.datetime] = None
+
+        # OI direction history for trend confirmation (deque of "CALL"/"PUT")
+        self._atm_dir_history: deque = deque(maxlen=OI_TREND_MINS)
+
+        # ── capital / balance tracking ────────────────────────
+        self._initial_capital:      float = 0.0  # what user set (never changes mid-session)
+        self._available_balance:    float = 0.0  # updated after every trade close
+        self._balance_before_trade: float = 0.0  # snapshot at entry for display + DB
+        self._entry_lots:           int   = 1    # lots computed at entry; used for exit qty
+
+        # ── in-trade state ─────────────────────────────────────
+        self._in_trade:       bool              = False
+        self._entry_time:     Optional[dt.datetime] = None
+        self._entry_px:       float             = 0.0
+        self._entry_strike:   int               = 0
+        self._entry_opt_type: str               = ""    # "CE" | "PE"
+        self._direction:      str               = ""    # "CALL" | "PUT"
+        self._trail_on:       bool              = False
+        self._oi_exit_consec: int               = 0
+        self._bars_in_trade:  int               = 0     # ticks elapsed since entry (for phase gate)
+        self._last_zone:      str               = "FAR_OTM"  # current zone for UI display
+        self._trade_num:      int               = 0     # 1-N within day
+        self._entry_security_id: str            = ""
+        self._entry_expiry:   str               = ""
+        self._e_atm_c = self._e_atm_p           = 0
+        self._e_outer_c = self._e_outer_p       = 0
+        self._e_atm_imb = self._e_outer_imb     = 0.0
+        self._e_spot:         float             = 0.0
+        self._e_open_ref:     float             = 0.0
+        self._e_atm:          int               = 0
+        self._current_trade_db_id: Optional[int] = None
+        self._broker_order_id:  Optional[str]  = None
+        self._all_order_ids:    list           = []   # all order IDs this trade (entry + any retries)
+        self._last_order_status: str           = ""   # "EXECUTED" | "REJECTED" | "TIMEOUT"
+
+        # ── per-instance tunable limits ────────────────────────
+        self._max_trades_day: int = MAX_TRADES_DAY
+
+        # ── target expiry override (ISO: "2026-06-16"; empty = use option chain's) ──
+        self._target_expiry: str = ""
+
+        # ── last-tick rows/atm kept for manual exit ────────────
+        self._last_rows: list = []
+        self._last_atm:  int  = 0
+
+        # ── last-tick summary for UI ───────────────────────────
+        self._last_state: dict = {}
+
+        self._ensure_columns()
+        self._load_persisted()
+
+    # ──────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────
+
+    def on_tick(self, oc: dict) -> dict:
+        with self._lock:
+            return self._process(oc)
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return dict(self._last_state)
+
+    def set_investment(self, amount: float) -> None:
+        """Set initial capital and reset running balance. Lots computed at entry from actual premium."""
+        with self._lock:
+            self._initial_capital   = max(0.0, float(amount))
+            self._available_balance = self._initial_capital
+            self._persist_balance()
+
+    def get_investment_info(self) -> dict:
+        """Return capital + running balance info for the UI."""
+        with self._lock:
+            return {
+                "initial_capital":   round(self._initial_capital, 2),
+                "available_balance": round(self._available_balance, 2),
+                "brokerage_per_trade": BROKERAGE,
+            }
+
+    # ── Capital / balance persistence helpers ─────────────────
+
+    def _ensure_columns(self) -> None:
+        """Add new columns to oi_trades if they don't exist yet (idempotent)."""
+        new_cols = [
+            ("entry_lots",     "INTEGER DEFAULT 1"),
+            ("balance_before", "REAL"),
+            ("total_pnl",      "REAL"),
+            ("brokerage",      "REAL"),
+            ("balance_after",  "REAL"),
+        ]
+        for col, typedef in new_cols:
+            try:
+                with self._store.lock:
+                    self._store.conn.execute(
+                        f"ALTER TABLE oi_trades ADD COLUMN {col} {typedef}")
+                    self._store.conn.commit()
+            except Exception:
+                pass   # column already exists
+
+    def _load_persisted(self) -> None:
+        """Load saved capital/balance from user_settings on engine init."""
+        if not self.user_id:
+            return
+        mode = "paper" if self.paper_mode else "live"
+        try:
+            cap = self._store.get_user_setting(self.user_id, f"oi_capital_{mode}")
+            bal = self._store.get_user_setting(self.user_id, f"oi_balance_{mode}")
+            if cap:
+                self._initial_capital   = float(cap)
+            if bal:
+                self._available_balance = float(bal)
+        except Exception:
+            pass
+
+    def _persist_balance(self) -> None:
+        """Save current capital + balance to user_settings."""
+        if not self.user_id:
+            return
+        mode = "paper" if self.paper_mode else "live"
+        try:
+            self._store.set_user_setting(
+                self.user_id, f"oi_capital_{mode}",
+                str(round(self._initial_capital, 2)))
+            self._store.set_user_setting(
+                self.user_id, f"oi_balance_{mode}",
+                str(round(self._available_balance, 2)))
+        except Exception:
+            pass
+
+    def get_today_trades(self) -> list:
+        today = cfg.now_ist().date().isoformat()
+        mode  = "paper" if self.paper_mode else "live"
+        with self._store.lock:
+            rows = self._store.conn.execute(
+                "SELECT * FROM oi_trades WHERE user_id=? AND mode=? AND date=? "
+                "ORDER BY id DESC",
+                (self.user_id, mode, today),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ──────────────────────────────────────────────────────────
+    # Internal — main tick
+    # ──────────────────────────────────────────────────────────
+
+    def _process(self, oc: dict) -> dict:
+        now  = cfg.now_ist()
+        rows = oc.get("rows") or []
+        spot = float(oc.get("spot") or 0)
+        if spot <= 0 or not rows:
+            self._last_state = self._build_state(now, "NO_DATA")
+            return self._last_state
+
+        atm = _atm_strike(spot)
+        self._last_rows = rows
+        self._last_atm  = atm
+
+        # ── daily reset ────────────────────────────────────────
+        if self._session_date != now.date():
+            self._daily_reset(now, spot)
+
+        # ── capture 09:15 open reference ──────────────────────
+        if now.hour == 9 and now.minute == 15 and self._open_ref == 0.0:
+            self._open_ref = spot
+
+        t_min = now.hour * 60 + now.minute
+
+        # ── hard exit guard ────────────────────────────────────
+        if t_min > HARD_EXIT_H * 60 + HARD_EXIT_M:
+            if self._in_trade:
+                self._exit_trade(rows, atm, now, "HARD_EXIT")
+            self._last_state = self._build_state(now, "AFTER_CLOSE")
+            return self._last_state
+
+        # Always update OI direction history for trend confirmation
+        atm_c_raw, atm_p_raw = _atm_oi(rows, atm)
+        atm_dir_raw = "CALL" if atm_c_raw < atm_p_raw else "PUT"
+        self._atm_dir_history.append(atm_dir_raw)
+
+        # ── in-trade: check exits every tick ──────────────────
+        if self._in_trade:
+            decision = self._check_exits(rows, atm, now)
+            self._log_decision(now, spot, atm, rows, decision)
+            self._last_state = self._build_state(now, decision)
+            return self._last_state
+
+        # ── not in trade: scan for entry ──────────────────────
+        scan_start   = SCAN_START_H   * 60 + SCAN_START_M
+        entry_cutoff = ENTRY_CUTOFF_H * 60 + ENTRY_CUTOFF_M
+        block_start  = BLOCK_START_H  * 60 + BLOCK_START_M
+        block_end    = BLOCK_END_H    * 60 + BLOCK_END_M
+
+        if t_min < scan_start:
+            self._last_state = self._build_state(now, "PRE_SCAN")
+            return self._last_state
+        if t_min > entry_cutoff:
+            self._last_state = self._build_state(now, "CUTOFF")
+            return self._last_state
+        if block_start <= t_min <= block_end:
+            decision = "BLOCK_HOUR"
+            self._log_decision(now, spot, atm, rows, decision)
+            self._last_state = self._build_state(now, decision)
+            return self._last_state
+        if self._trades_today >= self._max_trades_day:
+            self._last_state = self._build_state(now, "MAX_TRADES")
+            return self._last_state
+        if self._day_pnl <= DAILY_LOSS_LIMIT:
+            self._last_state = self._build_state(now, "DAILY_LOSS_LIMIT")
+            return self._last_state
+        if self._reentry_after and now < self._reentry_after:
+            secs = int((self._reentry_after - now).total_seconds())
+            decision = f"COOLDOWN({secs}s)"
+            self._log_decision(now, spot, atm, rows, decision)
+            self._last_state = self._build_state(now, decision)
+            return self._last_state
+
+        # ── evaluate entry signal (v29 imbalance ratio) ───────
+        valid, sig_dir, atm_c, atm_p, outer_c, outer_p, atm_imb, outer_imb, skip_reason = \
+            _evaluate_entry(rows, atm)
+
+        if not valid:
+            self._log_decision(now, spot, atm, rows, f"SKIP:{skip_reason}",
+                               atm_c=atm_c, atm_p=atm_p,
+                               outer_c=outer_c, outer_p=outer_p)
+            self._last_state = self._build_state(now, f"SKIP:{skip_reason}")
+            return self._last_state
+
+        # CALL block zone: skip when spot is in partial dip (-30 to 0 vs open)
+        if self._open_ref > 0:
+            svopen = spot - self._open_ref
+            if sig_dir == "CALL" and CALL_BLOCK_ZONE_LOW <= svopen <= CALL_BLOCK_ZONE_HIGH:
+                skip = f"CALL_DIP_ZONE(svopen={svopen:.0f})"
+                self._log_decision(now, spot, atm, rows, f"SKIP:{skip}",
+                                   atm_c=atm_c, atm_p=atm_p,
+                                   outer_c=outer_c, outer_p=outer_p)
+                self._last_state = self._build_state(now, f"SKIP:{skip}")
+                return self._last_state
+
+        # OI trend confirmation: signal must be consistent for OI_TREND_MINS ticks
+        if (len(self._atm_dir_history) < OI_TREND_MINS
+                or not all(d == sig_dir for d in self._atm_dir_history)):
+            skip = f"TREND_WAIT({len(self._atm_dir_history)}/{OI_TREND_MINS})"
+            self._log_decision(now, spot, atm, rows, f"SKIP:{skip}",
+                               atm_c=atm_c, atm_p=atm_p,
+                               outer_c=outer_c, outer_p=outer_p)
+            self._last_state = self._build_state(now, f"SKIP:{skip}")
+            return self._last_state
+
+        # premium check
+        off       = 2 if sig_dir == "CALL" else -2
+        entry_stk = atm + off * STRIKE_STEP
+        opt_type  = "CE" if sig_dir == "CALL" else "PE"
+        entry_row = _get_row(rows, entry_stk)
+        side_key  = "call" if sig_dir == "CALL" else "put"
+        px        = _ltp(entry_row, side_key)
+
+        if px < MIN_PREMIUM:
+            skip = f"PREMIUM_LOW({px:.0f})"
+            self._log_decision(now, spot, atm, rows, f"SKIP:{skip}",
+                               atm_c=atm_c, atm_p=atm_p,
+                               outer_c=outer_c, outer_p=outer_p)
+            self._last_state = self._build_state(now, f"SKIP:{skip}")
+            return self._last_state
+        if px > MAX_ENTRY_PREMIUM:
+            skip = f"PREMIUM_HIGH({px:.0f})"
+            self._log_decision(now, spot, atm, rows, f"SKIP:{skip}",
+                               atm_c=atm_c, atm_p=atm_p,
+                               outer_c=outer_c, outer_p=outer_p)
+            self._last_state = self._build_state(now, f"SKIP:{skip}")
+            return self._last_state
+
+        sec_id = _sec_id(entry_row, side_key)
+        expiry = oc.get("expiry", "")
+        self._enter_trade(now, spot, atm, sig_dir, entry_stk, opt_type,
+                          px, sec_id, expiry,
+                          atm_c, atm_p, outer_c, outer_p,
+                          atm_imb, outer_imb)
+
+        self._log_decision(now, spot, atm, rows, "ENTRY",
+                           atm_c=atm_c, atm_p=atm_p,
+                           outer_c=outer_c, outer_p=outer_p)
+        self._last_state = self._build_state(now, "ENTRY")
+        return self._last_state
+
+    # ──────────────────────────────────────────────────────────
+    # Exit logic
+    # ──────────────────────────────────────────────────────────
+
+    def _check_exits(self, rows: list, atm: int, now: dt.datetime) -> str:
+        entry_row = _get_row(rows, self._entry_strike)
+        side_key  = "call" if self._direction == "CALL" else "put"
+        cur_px    = _ltp(entry_row, side_key)
+        if cur_px <= 0:
+            return "IN_TRADE"
+
+        self._bars_in_trade += 1
+
+        # premium exits (always checked first)
+        if cur_px <= self._entry_px * (1 - SL_PCT):
+            self._exit_trade(rows, atm, now, "SL_HIT", cur_px)
+            return "SL_HIT"
+        if cur_px >= self._entry_px * (1 + TARGET_PCT):
+            self._exit_trade(rows, atm, now, "TARGET_HIT", cur_px)
+            return "TARGET_HIT"
+        if cur_px >= self._entry_px * (1 + TRAIL_TRIG_PCT):
+            self._trail_on = True
+        if self._trail_on and cur_px <= self._entry_px * (1 + TRAIL_LOCK_PCT):
+            self._exit_trade(rows, atm, now, "TRAIL_SL", cur_px)
+            return "TRAIL_SL"
+
+        # Hybrid OI exit — Phase 1 vs Phase 2
+        if self._bars_in_trade <= EARLY_ATM_BARS:
+            # Phase 1: fast-fail ATM-alone gate (v37 style)
+            atm_c, atm_p = _atm_oi(rows, atm)
+            atm_imb = _imbalance_ratio(atm_c, atm_p)
+            atm_dir = "CALL" if atm_c < atm_p else "PUT"
+            atm_ok  = (atm_imb >= EXIT_IMBALANCE_MIN) and (atm_dir == self._direction)
+            if not atm_ok:
+                self._oi_exit_consec += 1
+            else:
+                self._oi_exit_consec = 0
+            if self._oi_exit_consec >= EXIT_PERSIST:
+                _, _, early_zone, _ = self._dynamic_oi_exit(rows, atm)
+                self._last_zone = early_zone
+                self._exit_trade(rows, atm, now, "OI_EXIT_EARLY_ATM", cur_px)
+                return "OI_EXIT_EARLY_ATM"
+        else:
+            # Phase 2: dynamic zone exit (v43 logic)
+            both_failed, immediate_exit, zone, _ = self._dynamic_oi_exit(rows, atm)
+            self._last_zone = zone
+            if immediate_exit:
+                self._exit_trade(rows, atm, now, "OI_EXIT_ITM_REVERSAL", cur_px)
+                return "OI_EXIT_ITM_REVERSAL"
+            if both_failed:
+                self._oi_exit_consec += 1
+                if self._oi_exit_consec >= EXIT_PERSIST:
+                    reason_str = f"OI_EXIT_{zone}"
+                    self._exit_trade(rows, atm, now, reason_str, cur_px)
+                    return reason_str
+            else:
+                self._oi_exit_consec = 0
+
+        trail_str = " [TRAIL_ON]" if self._trail_on else ""
+        return f"IN_TRADE(ltp={cur_px:.1f},zone={self._last_zone}{trail_str})"
+
+    def _get_entry_strike_zone(self, atm: int) -> tuple:
+        """
+        Compute current offset of entry_strike relative to live ATM and return (offset, zone).
+        CALL: entry was ATM+2; as spot rises ATM rises; offset shrinks toward 0 then negative.
+        PUT:  entry was ATM-2; as spot falls ATM falls; offset grows toward 0 then positive.
+        """
+        current_offset = (self._entry_strike - atm) // STRIKE_STEP
+        if self._direction == "CALL":
+            if current_offset >= 2:    zone = "FAR_OTM"
+            elif current_offset == 1:  zone = "NEAR_OTM"
+            elif current_offset == 0:  zone = "ATM"
+            else:                      zone = "ITM"
+        else:  # PUT
+            if current_offset <= -2:   zone = "FAR_OTM"
+            elif current_offset == -1: zone = "NEAR_OTM"
+            elif current_offset == 0:  zone = "ATM"
+            else:                      zone = "ITM"
+        return current_offset, zone
+
+    def _dynamic_oi_exit(self, rows: list, atm: int) -> tuple:
+        """
+        Zone-aware OI exit (v43 Phase 2 logic).
+        Returns (both_failed, immediate_exit, zone, current_offset).
+          FAR_OTM  — ATM + outer (±1,±2) both must fail
+          NEAR_OTM — ATM + ring (±1 only) both must fail
+          ATM      — ATM alone failing is enough
+          ITM      — immediate exit on ATM direction reversal, no persist
+        """
+        current_offset, zone = self._get_entry_strike_zone(atm)
+
+        atm_c, atm_p = _atm_oi(rows, atm)
+        atm_imb = _imbalance_ratio(atm_c, atm_p)
+        atm_dir = "CALL" if atm_c < atm_p else "PUT"
+        atm_ok  = (atm_imb >= EXIT_IMBALANCE_MIN) and (atm_dir == self._direction)
+
+        if zone == "FAR_OTM":
+            outer_c, outer_p = _outer_oi(rows, atm)
+            outer_imb = _imbalance_ratio(outer_c, outer_p)
+            outer_dir = "CALL" if outer_c < outer_p else "PUT"
+            outer_ok  = (outer_imb >= EXIT_IMBALANCE_MIN) and (outer_dir == self._direction)
+            both_failed = (not atm_ok) and (not outer_ok)
+            return both_failed, False, zone, current_offset
+
+        elif zone == "NEAR_OTM":
+            ring_c = _oi(_get_row(rows, atm + STRIKE_STEP), "call")
+            ring_p = _oi(_get_row(rows, atm - STRIKE_STEP), "put")
+            ring_imb = _imbalance_ratio(ring_c, ring_p)
+            ring_dir = "CALL" if ring_c < ring_p else "PUT"
+            ring_ok  = (ring_imb >= EXIT_IMBALANCE_MIN) and (ring_dir == self._direction)
+            both_failed = (not atm_ok) and (not ring_ok)
+            return both_failed, False, zone, current_offset
+
+        elif zone == "ATM":
+            return (not atm_ok), False, zone, current_offset
+
+        else:  # ITM
+            reversal = (atm_dir != self._direction)
+            return False, reversal, zone, current_offset
+
+    # ──────────────────────────────────────────────────────────
+    # Enter / Exit
+    # ──────────────────────────────────────────────────────────
+
+    def _compute_lots(self, entry_px: float) -> int:
+        """Floor-divide available balance by cost-per-lot. Minimum 1."""
+        if self._available_balance <= 0 or entry_px <= 0:
+            return 1
+        cost_per_lot = entry_px * LOT   # premium × 75 shares/lot
+        return max(1, int(self._available_balance / cost_per_lot))
+
+    def _enter_trade(self, now, spot, atm, direction, entry_stk,
+                     opt_type, px, sec_id, expiry,
+                     atm_c, atm_p, outer_c, outer_p,
+                     atm_imb, outer_imb):
+        self._entry_lots            = self._compute_lots(px)  # compute before in_trade=True
+        self._balance_before_trade  = self._available_balance
+        self._in_trade              = True
+        self._entry_time         = now
+        self._entry_px           = px
+        self._entry_strike       = entry_stk
+        self._entry_opt_type     = opt_type
+        self._direction          = direction
+        self._trail_on           = False
+        self._oi_exit_consec     = 0
+        self._bars_in_trade      = 0
+        self._last_zone          = "FAR_OTM"
+        self._trade_num          = self._trades_today + 1
+        self._entry_security_id  = sec_id
+        self._entry_expiry       = expiry
+        self._e_atm_c, self._e_atm_p     = atm_c, atm_p
+        self._e_outer_c, self._e_outer_p = outer_c, outer_p
+        self._e_atm_imb, self._e_outer_imb = atm_imb, outer_imb
+        self._e_spot             = spot
+        self._e_open_ref         = self._open_ref
+        self._e_atm              = atm
+        self._broker_order_id = None
+        self._all_order_ids   = []
+
+        if not self.paper_mode:
+            threading.Thread(
+                target=self._place_entry_order,
+                args=(entry_stk, opt_type, sec_id, expiry, px),
+                daemon=True,
+            ).start()
+
+        mode = "paper" if self.paper_mode else "live"
+        try:
+            with self._store.lock:
+                cur = self._store.conn.execute(
+                    """INSERT INTO oi_trades
+                       (user_id, mode, date, day, trade_num,
+                        entry_time, direction, entry_strike, entry_opt_type,
+                        entry_premium, open_ref, entry_spot, spot_vs_open,
+                        entry_atm, entry_atm_call_L, entry_atm_put_L,
+                        entry_atm_diff_L, entry_atm_lower,
+                        entry_outer_call_L, entry_outer_put_L,
+                        entry_outer_diff_L, entry_outer_lower,
+                        atm_ratio, paper_mode, broker_order_id,
+                        entry_lots, balance_before)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        self.user_id, mode,
+                        now.date().isoformat(),
+                        now.strftime("%a"),
+                        self._trade_num,
+                        now.isoformat(timespec="seconds"),
+                        direction, entry_stk, opt_type,
+                        round(px, 2),
+                        round(self._open_ref, 1),
+                        round(spot, 1),
+                        round(spot - self._open_ref, 1) if self._open_ref else None,
+                        atm,
+                        round(atm_c / LAKH, 1),
+                        round(atm_p / LAKH, 1),
+                        round(abs(atm_c - atm_p) / LAKH, 1),
+                        "CALL" if atm_c < atm_p else "PUT",
+                        round(outer_c / LAKH, 1),
+                        round(outer_p / LAKH, 1),
+                        round(abs(outer_c - outer_p) / LAKH, 1),
+                        "CALL" if outer_c < outer_p else "PUT",
+                        round(_atm_ratio(atm_c, atm_p), 2),
+                        1 if self.paper_mode else 0,
+                        self._broker_order_id,
+                        self._entry_lots,
+                        round(self._balance_before_trade, 2),
+                    )
+                )
+                self._store.conn.commit()
+                self._current_trade_db_id = cur.lastrowid
+        except Exception as exc:
+            self._store.log("error", "oi_trade_insert_failed",
+                            user_id=self.user_id, error=str(exc))
+            self._current_trade_db_id = None
+
+        self._store.log("info", "oi_entry",
+                        user_id=self.user_id, mode=mode,
+                        direction=direction, strike=entry_stk,
+                        opt_type=opt_type, px=px, paper=self.paper_mode)
+
+    def _exit_trade(self, rows: list, atm: int,
+                    now: dt.datetime, reason: str,
+                    cur_px: Optional[float] = None):
+        if not self._in_trade:
+            return
+
+        if cur_px is None:
+            entry_row = _get_row(rows, self._entry_strike)
+            side_key  = "call" if self._direction == "CALL" else "put"
+            cur_px    = _ltp(entry_row, side_key) or self._entry_px
+
+        pnl_per_lot  = (cur_px - self._entry_px) * LOT          # P&L for 1 lot
+        total_pnl    = pnl_per_lot * self._entry_lots            # actual total for all lots
+        balance_after = max(0.0, self._balance_before_trade + total_pnl - BROKERAGE)
+        dur_min       = int((now - self._entry_time).total_seconds() / 60) if self._entry_time else 0
+
+        ex_atm_c,   ex_atm_p   = _atm_oi(rows, atm)
+        ex_outer_c, ex_outer_p = _outer_oi(rows, atm)
+
+        if not self.paper_mode:
+            threading.Thread(
+                target=self._place_exit_order,
+                daemon=True,
+            ).start()
+
+        mode = "paper" if self.paper_mode else "live"
+
+        # If INSERT failed earlier, try to recover the DB id by entry_time
+        if self._current_trade_db_id is None and self._entry_time:
+            try:
+                with self._store.lock:
+                    row = self._store.conn.execute(
+                        "SELECT id FROM oi_trades WHERE user_id=? AND mode=? AND date=? "
+                        "AND entry_time=? AND exit_time IS NULL ORDER BY id DESC LIMIT 1",
+                        (self.user_id, mode, now.date().isoformat(),
+                         self._entry_time.isoformat(timespec="seconds"))
+                    ).fetchone()
+                    if row:
+                        self._current_trade_db_id = row[0]
+            except Exception:
+                pass
+
+        try:
+            with self._store.lock:
+                self._store.conn.execute(
+                    """UPDATE oi_trades SET
+                       exit_time=?, exit_premium=?, pnl_per_lot=?,
+                       exit_reason=?, duration_min=?,
+                       exit_atm=?, exit_atm_call_L=?, exit_atm_put_L=?,
+                       exit_atm_diff_L=?, exit_atm_lower=?,
+                       exit_outer_call_L=?, exit_outer_put_L=?,
+                       exit_outer_diff_L=?, exit_outer_lower=?,
+                       total_pnl=?, brokerage=?, balance_after=?
+                       WHERE id=?""",
+                    (
+                        now.isoformat(timespec="seconds"),
+                        round(cur_px, 2),
+                        round(pnl_per_lot, 2),
+                        reason,
+                        dur_min,
+                        atm,
+                        round(ex_atm_c / LAKH, 1),
+                        round(ex_atm_p / LAKH, 1),
+                        round(abs(ex_atm_c - ex_atm_p) / LAKH, 1),
+                        "CALL" if ex_atm_c < ex_atm_p else "PUT",
+                        round(ex_outer_c / LAKH, 1),
+                        round(ex_outer_p / LAKH, 1),
+                        round(abs(ex_outer_c - ex_outer_p) / LAKH, 1),
+                        "CALL" if ex_outer_c < ex_outer_p else "PUT",
+                        round(total_pnl, 2),
+                        BROKERAGE,
+                        round(balance_after, 2),
+                        self._current_trade_db_id,
+                    )
+                )
+                self._store.conn.commit()
+        except Exception as exc:
+            self._store.log("error", "oi_trade_update_failed",
+                            user_id=self.user_id, error=str(exc))
+
+        # Update running balance and persist
+        self._available_balance = balance_after
+        self._persist_balance()
+
+        self._store.log("info", "oi_exit",
+                        user_id=self.user_id, mode=mode,
+                        reason=reason,
+                        pnl_per_lot=round(pnl_per_lot, 2),
+                        total_pnl=round(total_pnl, 2),
+                        lots=self._entry_lots,
+                        balance_after=round(balance_after, 2),
+                        strike=self._entry_strike, paper=self.paper_mode)
+
+        self._day_pnl      += pnl_per_lot   # day_pnl tracks per-lot for backward compat display
+        self._trades_today += 1
+        self._reentry_after = now + dt.timedelta(minutes=REENTRY_COOLDOWN)
+
+        self._in_trade            = False
+        self._trail_on            = False
+        self._oi_exit_consec      = 0
+        self._bars_in_trade       = 0
+        self._last_zone           = "FAR_OTM"
+        self._current_trade_db_id = None
+        self._broker_order_id     = None
+
+    # ──────────────────────────────────────────────────────────
+    # Broker order helpers
+    # ──────────────────────────────────────────────────────────
+
+    def _get_broker(self):
+        if not self._broker_registry or not self.user_id:
+            return None
+        return self._broker_registry.get_broker(self.user_id, use_for="strategy")
+
+    def _effective_expiry(self, chain_expiry: str) -> str:
+        """Return the expiry to use for orders: override if set, else option chain's."""
+        return self._target_expiry if self._target_expiry else chain_expiry
+
+    def _build_trading_sym(self, strike: int, opt_type: str, expiry_iso: str) -> str:
+        """Use mStock format if broker is mStock, else standard NSE format."""
+        broker = self._get_broker()
+        if broker and getattr(broker, "BROKER_ID", "") == "mstock":
+            return _mstock_trading_symbol(strike, opt_type, expiry_iso)
+        return _nse_trading_symbol(strike, opt_type, expiry_iso)
+
+    def _place_entry_order(self, strike: int, opt_type: str,
+                           sec_id: str, expiry: str, px: float):
+        broker = self._get_broker()
+        if not broker:
+            self._store.log("warn", "oi_live_no_broker",
+                            user_id=self.user_id, note="No broker connected")
+            self._last_order_status = "NO_BROKER"
+            return
+        effective   = self._effective_expiry(expiry)
+        trading_sym = self._build_trading_sym(strike, opt_type, effective)
+        qty         = self._entry_lots * LOT
+        self._store.log("info", "oi_live_placing_entry",
+                        user_id=self.user_id, sym=trading_sym,
+                        qty=qty, expiry=effective)
+        try:
+            from brokers.executor import OrderExecutor, OrderRejectedError, OrderTimeoutError
+            oid, status = OrderExecutor.place_with_retry(
+                broker=broker,
+                security_id=sec_id,
+                qty=qty,
+                side="BUY",
+                trading_symbol=trading_sym,
+            )
+            self._broker_order_id = oid
+            self._all_order_ids.append(oid)
+            self._last_order_status = status
+            self._store.log("info", "oi_live_entry_order",
+                            user_id=self.user_id, order_id=oid,
+                            status=status, sym=trading_sym,
+                            strike=strike, opt_type=opt_type,
+                            lots=self._entry_lots, qty=qty)
+        except Exception as exc:
+            self._last_order_status = "FAILED"
+            self._store.log("error", "oi_live_entry_failed",
+                            user_id=self.user_id, error=str(exc),
+                            sym=trading_sym, strike=strike, lots=self._entry_lots)
+
+    def _place_exit_order(self):
+        broker = self._get_broker()
+        if not broker:
+            self._last_order_status = "NO_BROKER"
+            return
+        effective   = self._effective_expiry(self._entry_expiry)
+        trading_sym = self._build_trading_sym(
+            self._entry_strike, self._entry_opt_type, effective)
+        qty = self._entry_lots * LOT
+        self._store.log("info", "oi_live_placing_exit",
+                        user_id=self.user_id, sym=trading_sym, qty=qty)
+        try:
+            from brokers.executor import OrderExecutor, OrderRejectedError, OrderTimeoutError
+            oid, status = OrderExecutor.place_with_retry(
+                broker=broker,
+                security_id=self._entry_security_id,
+                qty=qty,
+                side="SELL",
+                trading_symbol=trading_sym,
+            )
+            self._all_order_ids.append(oid)
+            self._last_order_status = status
+            self._store.log("info", "oi_live_exit_order",
+                            user_id=self.user_id, order_id=oid,
+                            status=status, sym=trading_sym,
+                            strike=self._entry_strike,
+                            lots=self._entry_lots, qty=qty)
+        except Exception as exc:
+            self._last_order_status = "FAILED"
+            self._store.log("error", "oi_live_exit_failed",
+                            user_id=self.user_id, error=str(exc),
+                            sym=trading_sym, strike=self._entry_strike,
+                            lots=self._entry_lots)
+
+    # ──────────────────────────────────────────────────────────
+    # Public manual-control API (called from web routes)
+    # ──────────────────────────────────────────────────────────
+
+    def set_max_trades(self, n: int) -> None:
+        with self._lock:
+            self._max_trades_day = max(1, int(n))
+
+    def set_target_expiry(self, expiry_iso: str) -> None:
+        """Set the expiry date (ISO: '2026-06-16') to use for order placement.
+        Empty string = use the option chain's own expiry (default)."""
+        with self._lock:
+            self._target_expiry = expiry_iso.strip()
+
+    def manual_exit(self) -> dict:
+        """Force-exit the current trade from the UI. Thread-safe."""
+        with self._lock:
+            if not self._in_trade:
+                return {"ok": False, "error": "Not in trade"}
+            rows = self._last_rows
+            atm  = self._last_atm
+            now  = cfg.now_ist()
+            if not rows or not atm:
+                return {"ok": False, "error": "No tick data yet — try again in a moment"}
+            try:
+                self._exit_trade(rows, atm, now, "MANUAL_EXIT")
+                return {"ok": True}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def manual_modify_order(self, qty_lots: int | None = None,
+                            price: float | None = None,
+                            order_type: str | None = None) -> dict:
+        """Modify the live broker order for the current trade."""
+        with self._lock:
+            if not self._in_trade:
+                return {"ok": False, "error": "Not in trade"}
+            if not self._broker_order_id:
+                return {"ok": False, "error": "No broker order ID (paper mode or order not placed)"}
+            broker = self._get_broker()
+            if not broker:
+                return {"ok": False, "error": "No broker connected"}
+            qty = (qty_lots * LOT) if qty_lots else None
+            try:
+                ok = broker.modify_order(
+                    order_id   = self._broker_order_id,
+                    qty        = qty,
+                    price      = price,
+                    order_type = order_type,
+                )
+                return {"ok": ok, "order_id": self._broker_order_id}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    # ──────────────────────────────────────────────────────────
+    # Decision log
+    # ──────────────────────────────────────────────────────────
+
+    def _log_decision(self, now: dt.datetime, spot: float, atm: int,
+                      rows: list, decision: str,
+                      atm_c: int = 0, atm_p: int = 0,
+                      outer_c: int = 0, outer_p: int = 0):
+        atm_diff    = abs(atm_c - atm_p)
+        outer_diff  = abs(outer_c - outer_p)
+        ratio_val   = _atm_ratio(atm_c, atm_p)
+        outer_atm_r = (outer_diff / atm_diff) if atm_diff > 0 else 0
+        mode = "paper" if self.paper_mode else "live"
+        try:
+            with self._store.lock:
+                self._store.conn.execute(
+                    """INSERT INTO oi_decisions
+                       (user_id, mode, ts, date, spot, atm_strike,
+                        atm_c_L, atm_p_L, atm_diff_L,
+                        outer_c_L, outer_p_L, outer_diff_L,
+                        atm_ratio, outer_atm_ratio,
+                        direction, signal_valid, decision, in_trade)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        self.user_id, mode,
+                        now.isoformat(timespec="seconds"),
+                        now.date().isoformat(),
+                        round(spot, 1), atm,
+                        round(atm_c / LAKH, 1), round(atm_p / LAKH, 1),
+                        round(atm_diff / LAKH, 1),
+                        round(outer_c / LAKH, 1), round(outer_p / LAKH, 1),
+                        round(outer_diff / LAKH, 1),
+                        round(ratio_val, 2),
+                        round(outer_atm_r, 2),
+                        "CALL" if atm_c < atm_p else ("PUT" if atm_p < atm_c else None),
+                        1 if decision == "ENTRY" else 0,
+                        decision,
+                        1 if self._in_trade else 0,
+                    )
+                )
+                self._store.conn.commit()
+        except Exception:
+            pass   # decision log is best-effort
+
+    # ──────────────────────────────────────────────────────────
+    # State / summary for UI
+    # ──────────────────────────────────────────────────────────
+
+    def _build_state(self, now: dt.datetime, last_decision: str) -> dict:
+        mode = "paper" if self.paper_mode else "live"
+        state: dict = {
+            "mode":              mode,
+            "user_id":           self.user_id,
+            "in_trade":          self._in_trade,
+            "trades_today":      self._trades_today,
+            "max_trades":        self._max_trades_day,
+            "day_pnl":           round(self._day_pnl, 2),
+            "last_decision":     last_decision,
+            "ts":                now.isoformat(timespec="seconds"),
+            "initial_capital":   round(self._initial_capital, 2),
+            "available_balance": round(self._available_balance, 2),
+            "brokerage_per_trade": BROKERAGE,
+            "last_order_status": self._last_order_status,
+            "target_expiry":     self._target_expiry,
+        }
+        if self._in_trade:
+            cost_per_lot = round(self._entry_px * LOT, 2)
+            total_cost   = round(cost_per_lot * self._entry_lots, 2)
+            state["trade"] = {
+                "direction":     self._direction,
+                "entry_strike":  self._entry_strike,
+                "opt_type":      self._entry_opt_type,
+                "entry_px":      self._entry_px,
+                "entry_time":    self._entry_time.strftime("%H:%M") if self._entry_time else "",
+                "trail_on":      self._trail_on,
+                "trade_num":     self._trade_num,
+                "lots":          self._entry_lots,
+                "cost_per_lot":  cost_per_lot,
+                "total_cost":    total_cost,
+                "sl_price":      round(self._entry_px * (1 - SL_PCT), 2),
+                "target_price":  round(self._entry_px * (1 + TARGET_PCT), 2),
+                "trail_trigger": round(self._entry_px * (1 + TRAIL_TRIG_PCT), 2),
+                "trail_lock":    round(self._entry_px * (1 + TRAIL_LOCK_PCT), 2),
+                "current_zone":  self._last_zone,
+                "bars_in_trade": self._bars_in_trade,
+                "broker_order_id": self._broker_order_id or "",
+            }
+        if self._reentry_after and not self._in_trade:
+            secs = max(0, int((self._reentry_after - now).total_seconds()))
+            state["cooldown_secs"] = secs
+        return state
+
+    def _daily_reset(self, now: dt.datetime, spot: float):
+        self._session_date        = now.date()
+        self._open_ref            = 0.0
+        self._day_pnl             = 0.0
+        self._trades_today        = 0
+        self._reentry_after       = None
+        self._in_trade            = False
+        self._trail_on            = False
+        self._oi_exit_consec      = 0
+        self._bars_in_trade       = 0
+        self._last_zone           = "FAR_OTM"
+        self._current_trade_db_id = None
+        self._broker_order_id     = None
+        self._last_order_status   = ""
+        self._entry_lots            = 1
+        self._balance_before_trade  = 0.0
+        self._atm_dir_history.clear()
+        # NOTE: _initial_capital and _available_balance intentionally NOT reset —
+        # running balance carries across trading days
+
+
+# ─────────────────────────────────────────────────────────────
+# Summary helpers (called from API)
+# ─────────────────────────────────────────────────────────────
+
+def get_oi_summary(store, user_id: int, mode: str,
+                   start: str = "", end: str = "") -> dict:
+    """Return aggregated P&L summary for the OI strategy page."""
+    where  = ["user_id=?", "mode=?", "exit_time IS NOT NULL"]
+    params: list = [user_id, mode]
+    if start:
+        where.append("date>=?"); params.append(start)
+    if end:
+        where.append("date<=?"); params.append(end)
+
+    with store.lock:
+        rows = store.conn.execute(
+            f"SELECT * FROM oi_trades WHERE {' AND '.join(where)} ORDER BY id",
+            params,
+        ).fetchall()
+
+    trades = [dict(r) for r in rows]
+    if not trades:
+        return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0,
+                "net_pnl": 0, "gross_profit": 0, "gross_loss": 0,
+                "avg_win": 0, "avg_loss": 0, "max_consec_loss": 0,
+                "by_exit": {}, "by_direction": {}}
+
+    wins   = [t for t in trades if (t.get("pnl_per_lot") or 0) > 0]
+    losses = [t for t in trades if (t.get("pnl_per_lot") or 0) <= 0]
+    gp     = sum(t["pnl_per_lot"] for t in wins)
+    gl     = abs(sum(t["pnl_per_lot"] for t in losses))
+    net    = sum(t["pnl_per_lot"] or 0 for t in trades)
+    n      = len(trades)
+    wr     = round(len(wins) / n * 100, 1) if n else 0
+
+    streak = max_streak = 0
+    for t in trades:
+        streak = streak + 1 if (t.get("pnl_per_lot") or 0) <= 0 else 0
+        max_streak = max(max_streak, streak)
+
+    by_exit = {}
+    for t in trades:
+        er = t.get("exit_reason") or "unknown"
+        if er not in by_exit:
+            by_exit[er] = {"count": 0, "pnl": 0.0}
+        by_exit[er]["count"] += 1
+        by_exit[er]["pnl"]   += t.get("pnl_per_lot") or 0
+
+    by_dir = {}
+    for t in trades:
+        d = t.get("direction") or "?"
+        if d not in by_dir:
+            by_dir[d] = {"count": 0, "wins": 0, "pnl": 0.0}
+        by_dir[d]["count"] += 1
+        if (t.get("pnl_per_lot") or 0) > 0:
+            by_dir[d]["wins"] += 1
+        by_dir[d]["pnl"] += t.get("pnl_per_lot") or 0
+
+    return {
+        "total":           n,
+        "wins":            len(wins),
+        "losses":          len(losses),
+        "win_rate":        wr,
+        "net_pnl":         round(net, 2),
+        "gross_profit":    round(gp, 2),
+        "gross_loss":      round(gl, 2),
+        "avg_win":         round(gp / len(wins), 2) if wins else 0,
+        "avg_loss":        round(gl / len(losses), 2) if losses else 0,
+        "max_consec_loss": max_streak,
+        "by_exit":         {k: {"count": v["count"], "pnl": round(v["pnl"], 2)}
+                            for k, v in by_exit.items()},
+        "by_direction":    {k: {"count": v["count"], "wins": v["wins"],
+                                "win_rate": round(v["wins"]/v["count"]*100, 1),
+                                "pnl": round(v["pnl"], 2)}
+                            for k, v in by_dir.items()},
+    }
